@@ -54,6 +54,32 @@ class Contracts(unittest.TestCase):
         self.assertEqual(values, {})
         self.assertIsNone(target)
 
+    def test_city_profile_format_and_legacy_profiles(self):
+        self.assertEqual(h.parse_city(' 上海市 / 上海市 / 徐汇区 '), ('上海市', '上海市', '徐汇区'))
+        for bad in ('上海市', '上海市/徐汇区', '上海市//徐汇区', '/上海市/徐汇区', 'a/b/c/d'):
+            with self.subTest(bad=bad), self.assertRaises(h.ProfileError):
+                h.parse_city(bad)
+        folder = ROOT / '.test-temp'
+        folder.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=folder, suffix='.json', delete=False) as f:
+            json.dump({'报名资料': {'所在城市': '上海市/上海市/徐汇区'}}, f, ensure_ascii=False)
+            path = Path(f.name)
+        self.assertEqual(h.read_profile(path)[0]['所在城市'], '上海市/上海市/徐汇区')
+        path.write_text('{"报名资料": {}}', encoding='utf-8')
+        self.assertEqual(h.read_profile(path)[0], {})
+        path.write_text(json.dumps({'报名资料': {'所在城市': '上海市/徐汇区'}}, ensure_ascii=False), encoding='utf-8')
+        with self.assertRaises(h.ProfileError):
+            h.read_profile(path)
+
+    def test_city_legacy_object_parser_never_executes_expressions(self):
+        expected = {'province': '上海市', 'city': '上海市', 'xian': '徐汇区'}
+        self.assertEqual(h._city_data(json.dumps(expected, ensure_ascii=False)), expected)
+        self.assertEqual(h._city_data('{province:"上海市",city:"上海市",xian:"徐汇区"}'), expected)
+        for raw in ('{province:alert(1),city:"上海市",xian:"徐汇区"}',
+                    '{province:true,city:"上海市",xian:"徐汇区"}', '[]', '{}', 'invalid'):
+            with self.subTest(raw=raw):
+                self.assertIsNone(h._city_data(raw))
+
 
 class BrowserFixture(unittest.TestCase):
     @classmethod
@@ -73,6 +99,114 @@ class BrowserFixture(unittest.TestCase):
 
     def tearDown(self):
         self.page.close()
+
+    def city_fixture(self, *, cached=False, missing=False, broken='', disabled=False, duplicate=False):
+        # A local implementation of the frozen renderer's documented DOM contract.
+        self.page.set_content('''<!doctype html><meta charset="utf-8">
+          <form onsubmit="window.submits++;return false">
+            <div class="bx_ui_form_tab_n_city"><input name="city_text" readonly><input name="city" type="hidden"></div>
+            <input type="checkbox" name="agree"><button type="submit">提交</button>
+          </form><script>
+          window.submits=0;window.cityChanges=0;window.cityClicks=[];
+          window.cityConfig={cached:false,missing:false,broken:'',disabled:false,duplicate:false};
+          window.initCity=()=>{
+            const config=window.cityConfig, row=document.querySelector('.bx_ui_form_tab_n_city');
+            const text=row.querySelector('[name=city_text]'), hidden=row.querySelector('[name=city]');
+            const data={'上海市':{'上海市':['徐汇区','黄浦区']},'浙江省':{'杭州市':['西湖区','上城区']}};
+            hidden.value=config.cached?JSON.stringify({province:'浙江省',city:'杭州市',xian:'西湖区'}):'';
+            text.value=config.cached?'浙江省 杭州市 西湖区':'';
+            text.disabled=config.disabled;
+            for(const input of [hidden,text])input.onchange=()=>window.cityChanges++;
+            text.onclick=()=>{
+              if(document.querySelector('.bx_ui_area'))return;
+              const state=hidden.value?JSON.parse(hidden.value):{province:'',city:'',xian:''};
+              let armed=!config.cached;
+              if(config.cached)setTimeout(()=>armed=true,100);
+              const picker=document.createElement('div');picker.className='bx_ui_area';
+              picker.innerHTML='<a href="#" class="bx_ui_area_close">关闭</a><div class="bx_ui_area_navi">'+
+                ['province','city','xian'].map(n=>'<a href="#" class="bx_ui_area_navi_item" n="'+n+'">'+n+'</a>').join('')+
+                '</div><ul class="bx_ui_area_list_ul"></ul>';
+              document.body.append(picker);
+              picker.querySelector('.bx_ui_area_close').onclick=e=>{e.preventDefault();picker.remove()};
+              const tabs=[...picker.querySelectorAll('.bx_ui_area_navi_item')];
+              function render(column){
+                for(const tab of tabs)tab.classList.toggle('bx_ui_area_navi_item_selected',tab.getAttribute('n')===column);
+                const ul=picker.querySelector('ul');ul.innerHTML='';
+                const values=column==='province'?Object.keys(data):column==='city'?Object.keys(data[state.province]||{}):
+                  (data[state.province]||{})[state.city]||[];
+                const options=config.missing&&column==='xian'?values.filter(v=>v!=='徐汇区'):values;
+                const choices=config.duplicate&&column==='province'?[...options,'上海市']:options;
+                for(const value of choices){
+                  const item=document.createElement('li');item.className='bx_ui_area_list_li';item.setAttribute('v',value);
+                  const label=document.createElement('span');label.className='bx_ui_area_list_li_text';label.textContent=value;item.append(label);
+                  item.onclick=()=>{
+                    window.cityClicks.push(column+':'+value);
+                    if(state[column]!==value){if(column==='province'){state.city='';state.xian=''}else if(column==='city')state.xian=''}
+                    state[column]=value;
+                    if(column==='province')render('city');else if(column==='city')render('xian');else if(armed){
+                      hidden.value=config.broken==='hidden'?'{}':JSON.stringify(state);
+                      text.value=config.broken==='text'?'错误城市':[...new Set([state.province,state.city,state.xian])].join(' ');
+                      hidden.dispatchEvent(new Event('change',{bubbles:true}));text.dispatchEvent(new Event('change',{bubbles:true}));
+                      setTimeout(()=>picker.remove(),20);
+                    }
+                  };ul.append(item);
+                }
+              }
+              for(const tab of tabs)tab.onclick=e=>{e.preventDefault();render(tab.getAttribute('n'))};
+              render(config.cached?'xian':'province');
+            };
+          };
+          </script>''')
+        self.page.evaluate('config => {window.cityConfig=config;window.initCity()}',
+                           {'cached': cached, 'missing': missing, 'broken': broken,
+                            'disabled': disabled, 'duplicate': duplicate})
+
+    def test_city_selects_three_levels_and_checks_both_values(self):
+        self.city_fixture()
+        self.assertEqual(h.fill_fields(self.page, {'所在城市': '上海市/上海市/徐汇区'}, offline_test=True),
+                         [{'label': '所在城市', 'status': 'filled'}])
+        self.assertEqual(json.loads(self.page.locator('[name=city]').input_value()),
+                         {'province': '上海市', 'city': '上海市', 'xian': '徐汇区'})
+        self.assertEqual(self.page.locator('[name=city_text]').input_value(), '上海市 徐汇区')
+        self.assertEqual(self.page.evaluate('window.cityClicks'), ['province:上海市', 'city:上海市', 'xian:徐汇区'])
+        self.assertEqual(self.page.evaluate('window.cityChanges'), 2)
+        self.assertEqual(self.page.evaluate('window.submits'), 0)
+        self.assertFalse(self.page.locator('[name=agree]').is_checked())
+        self.assertEqual(self.requests, [])
+
+    def test_city_reselects_cached_address_and_accepts_unique_suffix_alias(self):
+        self.city_fixture(cached=True)
+        self.assertEqual(h.fill_fields(self.page, {'所在城市': '上海/上海/徐汇区'}, offline_test=True)[0]['status'], 'filled')
+        self.assertEqual(json.loads(self.page.locator('[name=city]').input_value())['province'], '上海市')
+        self.assertEqual(self.page.evaluate('window.cityClicks')[0], 'province:上海市')
+        self.assertEqual(self.page.evaluate('window.submits'), 0)
+
+    def test_city_missing_or_ambiguous_option_cancels_without_changing_saved_data(self):
+        for config in ({'missing': True}, {'duplicate': True}):
+            with self.subTest(config=config):
+                self.city_fixture(cached=True, **config)
+                before = self.page.locator('[name=city]').input_value()
+                result = h.fill_fields(self.page, {'所在城市': '上海市/上海市/徐汇区'}, offline_test=True)
+                self.assertEqual(result[0]['status'], 'option_missing')
+                self.assertEqual(self.page.locator('[name=city]').input_value(), before)
+                self.assertEqual(self.page.locator('.bx_ui_area').count(), 0)
+                self.assertEqual(self.page.evaluate('window.submits'), 0)
+
+    def test_city_rejects_stale_hidden_or_display_values(self):
+        for broken in ('hidden', 'text'):
+            with self.subTest(broken=broken):
+                self.city_fixture(broken=broken)
+                result = h.fill_fields(self.page, {'所在城市': '上海市/上海市/徐汇区'}, offline_test=True)
+                self.assertEqual(result[0]['status'], 'not_confirmed')
+                self.assertEqual(self.page.evaluate('window.submits'), 0)
+
+    def test_city_disabled_and_invalid_configuration_do_not_click(self):
+        self.city_fixture(disabled=True)
+        self.assertEqual(h.fill_fields(self.page, {'所在城市': '上海市/上海市/徐汇区'}, offline_test=True)[0]['status'], 'manual_control')
+        self.city_fixture()
+        self.assertEqual(h.fill_fields(self.page, {'所在城市': '上海市/徐汇区'}, offline_test=True)[0]['status'], 'invalid_city')
+        self.assertEqual(self.page.evaluate('window.cityClicks'), [])
+        self.assertEqual(self.page.evaluate('window.submits'), 0)
 
     def test_fill_readback_skip_and_no_submission(self):
         self.page.set_content('''<script>window.submits=0;window.changes=0;</script>

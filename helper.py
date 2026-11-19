@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -13,7 +14,6 @@ from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTi
 from playwright.sync_api import sync_playwright
 
 HERE = Path(__file__).resolve().parent
-# When cloned, keep the dedicated browser profile beside this script.
 TASK = HERE
 ENTRY = 'https://www.xuhui-marathon.com/b/FrAJj2/entry.html'
 PREFIX = '/b/FrAJj2/'
@@ -28,17 +28,25 @@ FIELDS = {
     '手机号码': ('mobile', 'text'),
     '电子邮件': ('email', 'text'),
     '所在国家或地区': ('country', 'select'),
+    '所在城市': ('city', 'city'),
     '所在地址': ('address', 'text'),
     '血型': ('blood', 'select'),
     '衣服尺码': ('clothesize', 'select'),
     '紧急联系人姓名': ('contactname', 'text'),
     '紧急联系人手机号码': ('contactmobile', 'text'),
 }
-MANUAL = ['所在城市', '参赛声明', '监护人声明（如适用）', '装备信息/成绩/资格确认', '验证码（如出现）', '最终核对、提交与付款']
+MANUAL = ['参赛声明', '监护人声明（如适用）', '装备信息/成绩/资格确认', '验证码（如出现）', '最终核对、提交与付款']
 
 
 class ProfileError(ValueError):
     pass
+
+
+def parse_city(value: str) -> tuple[str, str, str]:
+    parts = tuple(part.strip() for part in value.split('/'))
+    if len(parts) != 3 or not all(parts):
+        raise ProfileError('所在城市请填写“省/市/区县”，例如“上海市/上海市/徐汇区”。')
+    return parts
 
 
 def parse_target(value: str, now: datetime | None = None) -> datetime | None:
@@ -71,6 +79,8 @@ def read_profile(path: Path) -> tuple[dict[str, str], datetime | None]:
     if any(not isinstance(v, str) or len(v) > 500 for v in values.values()):
         raise ProfileError('每项资料必须是长度不超过500的字符串。')
     values = {k: v.strip() for k, v in values.items() if v.strip()}
+    if '所在城市' in values:
+        parse_city(values['所在城市'])
     for label in ('手机号码', '紧急联系人手机号码'):
         value = values.get(label)
         if value and (len(value) != 11 or not value.isascii() or not value.isdigit() or value[0] != '1'):
@@ -179,6 +189,92 @@ def select_value(page, row, field: str, value: str) -> str:
     return 'filled' if select.input_value() == value else 'not_confirmed'
 
 
+def _city_name(value: str, column: str) -> str:
+    # Only accept an unambiguous province/city suffix alias; districts stay exact.
+    return value.removesuffix('省').removesuffix('市') if column != 'xian' else value
+
+
+def _city_data(raw: str) -> dict[str, str] | None:
+    # bxPub.serialize leaves these property names unquoted. Quote only known keys
+    # and parse as JSON; never evaluate JavaScript from a hidden field.
+    normalized = re.sub(r'([{,]\s*)(province|city|xian)(\s*:)', r'\1"\2"\3', raw)
+    try:
+        saved = json.loads(normalized)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if (not isinstance(saved, dict) or set(saved) != {'province', 'city', 'xian'}
+            or any(not isinstance(part, str) for part in saved.values())):
+        return None
+    return saved
+
+
+def _city_readback(row, expected: dict[str, str], labels: list[str]) -> bool:
+    saved = _city_data(row.locator('input[name="city"]').input_value())
+    shown = ' '.join(row.locator('input[name="city_text"]').input_value().split())
+    # The official widget omits repeated display labels, including municipalities.
+    display = ' '.join(' '.join(dict.fromkeys(labels)).split())
+    return saved == expected and shown == display
+
+
+def select_city(page, row, value: str) -> str:
+    try:
+        parts = parse_city(value)
+    except ProfileError:
+        return 'invalid_city'
+    opener = row.locator('input[name="city_text"]')
+    hidden = row.locator('input[name="city"][type="hidden"]')
+    if (opener.count() != 1 or hidden.count() != 1 or not opener.is_visible()
+            or opener.is_disabled() or hidden.is_disabled()
+            or 'disabled' in (row.get_attribute('class') or '').split()
+            or page.locator('.bx_ui_area').count()):
+        return 'manual_control'
+    picker = page.locator('.bx_ui_area')
+    try:
+        opener.click(timeout=3000)
+        picker.first.wait_for(state='visible', timeout=3000)
+        if picker.count() != 1:
+            return 'manual_control'
+        # With a cached selection the official widget arms its save handler at 100ms.
+        page.wait_for_timeout(150)
+        expected, labels = {}, []
+        for column, requested in zip(('province', 'city', 'xian'), parts):
+            tab = picker.locator(f'.bx_ui_area_navi_item[n="{column}"]')
+            if tab.count() != 1 or not tab.is_visible():
+                return 'manual_control'
+            tab.click(timeout=3000)
+            picker.locator(f'.bx_ui_area_navi_item_selected[n="{column}"]').wait_for(
+                state='visible', timeout=3000)
+            options = picker.locator('.bx_ui_area_list_ul .bx_ui_area_list_li')
+            options.first.wait_for(state='visible', timeout=3000)
+            items = options.evaluate_all('els => els.map((el, index) => ({index, value: el.getAttribute("v")}))')
+            matches = [item for item in items if item['value'] == requested]
+            if not matches:
+                matches = [item for item in items if isinstance(item['value'], str)
+                           and _city_name(item['value'], column) == _city_name(requested, column)]
+            if len(matches) != 1:
+                return 'option_missing'
+            selected = matches[0]
+            option = options.nth(selected['index'])
+            text = option.locator('.bx_ui_area_list_li_text')
+            if (not option.is_visible() or option.get_attribute('v') != selected['value']
+                    or option.is_disabled() or option.get_attribute('aria-disabled') == 'true'
+                    or 'disabled' in (option.get_attribute('class') or '').split()
+                    or text.count() != 1):
+                return 'manual_control'
+            expected[column] = selected['value']
+            labels.append(text.inner_text().strip())
+            option.click(timeout=3000)
+        picker.wait_for(state='detached', timeout=3000)
+        return 'filled' if _city_readback(row, expected, labels) else 'not_confirmed'
+    finally:
+        # Cancel only the picker opened above; never write hidden JSON ourselves.
+        if picker.count() == 1:
+            close = picker.locator('.bx_ui_area_close')
+            if close.count() == 1 and close.is_visible():
+                close.click(timeout=3000)
+                picker.wait_for(state='detached', timeout=3000)
+
+
 def fill_fields(page, values: dict[str, str], *, offline_test=False) -> list[dict[str, str]]:
     if not offline_test and not event_page(page.url, 'reg.html'):
         return [{'label': '报名表', 'status': 'wrong_page'}]
@@ -194,7 +290,9 @@ def fill_fields(page, values: dict[str, str], *, offline_test=False) -> list[dic
         status = 'missing_or_hidden'
         try:
             if row.count() == 1 and row.is_visible():
-                if kind == 'select':
+                if kind == 'city':
+                    status = select_city(page, row, value)
+                elif kind == 'select':
                     if field == 'clothesize':
                         # Event 6075's public extend.js rebuilds these options 500ms after sex changes.
                         page.wait_for_timeout(750)
@@ -304,7 +402,7 @@ def confirm_and_click_submit(page, answer_reader=input) -> str:
 
 
 def assisted_submit(page, timeout_seconds=1800, answer_reader=input) -> str:
-    print('请手动完成声明、验证码/排队、城市和其它手动字段，并在网页上点击“下一步/查看”进入预览。助手不会点击这些步骤。', flush=True)
+    print('请核对自动填写结果，手动补齐未填成功的字段并完成声明、验证码/排队，再在网页上点击“下一步/查看”进入预览。助手不会点击这些步骤。', flush=True)
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if page.is_closed() or not event_page(page.url):
