@@ -587,6 +587,83 @@ class TextNormalization(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertIsNone(agreements._parse_init_script(source, 'bm'))
 
+    def test_exact_valid_date_literals_are_read_as_string_data(self):
+        for quote_mark in ("'", '"'):
+            source = ('webPages.saishi.bm.init({"nowTime":new Date(' + quote_mark
+                      + '2024/02/29 23:59:59' + quote_mark + '),"flag":true})')
+            self.assertEqual(agreements._parse_init_script(source, 'bm'),
+                             {'nowTime': '2024/02/29 23:59:59', 'flag': True})
+
+    def test_json_strings_containing_date_or_code_text_are_unchanged(self):
+        data = {'first': "new Date('2026/11/19 11:23:29')",
+                'second': 'new Date("invalid date"); new Function("do not execute")',
+                'escaped': '引号"与反斜杠\\及 new Date(\'2026/02/30 00:00:00\')'}
+        original = json.dumps(data, ensure_ascii=False, indent=2)
+        self.assertEqual(agreements._json_with_date_data(original), original)
+        self.assertEqual(agreements._parse_init_script('webPages.saishi.bm.init(' + original + ')', 'bm'), data)
+
+    def test_invalid_dates_and_other_constructor_expressions_are_rejected(self):
+        expressions = (
+            "new Date('2026/02/30 00:00:00')",
+            "new Date('2025/02/29 00:00:00')",
+            "new Date('2026/01/01 24:00:00')",
+            "new Date('0000/01/01 00:00:00')",
+            "new Date('2026/11/19 11:23:29',other())",
+            "new Date(Date.now())",
+            "Date('2026/11/19 11:23:29')",
+            "new Function('malicious code')",
+            "new Date('2026/11/19 11:23:29').getTime()",
+            "new Date('2026/11/19 11:23:29')+1",
+        )
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                self.assertIsNone(agreements._parse_init_script(
+                    'webPages.saishi.bm.init({"nowTime":' + expression + '})', 'bm'))
+        self.assertIsNone(agreements._parse_init_script(
+            'webPages.saishi.bm.init({"nowTime":new Date("2026/11/19 11:23:29"),"nowTime":1})', 'bm'))
+        self.assertIsNone(agreements._parse_init_script(
+            'webPages.saishi.bm.init({"nowTime":new Date("2026/11/19 11:23:29")});other()', 'bm'))
+
+
+class CurrentArchitectureLiterals(unittest.TestCase):
+    """Read the separately cached current public HTML; never execute or fetch it."""
+    PINS = {
+        'reg.html.decoded': '0a9d4f3c29a0695bb89815b84d74f5499225a9302eefa11e878c60f9df619876',
+        'agree.html.decoded': 'b8a90c35aa6653ea445bd4ada680fc2323bfe235a8e9d80f3ca61b1c6e1f0871',
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source_root = Path(os.environ.get('WESTBUND_ARCHITECTURE_ASSETS',
+                                              ROOT / 'records/architecture-check-20261119/attempt-01'))
+        missing = [name for name in cls.PINS if not (cls.source_root / name).is_file()]
+        if missing:
+            raise unittest.SkipTest('Current frozen public init assets absent: ' + ', '.join(missing))
+
+    def test_current_real_initial_scripts_parse_with_unchanged_contract_pins(self):
+        for filename, expected_sha in self.PINS.items():
+            with self.subTest(filename=filename):
+                raw = (self.source_root / filename).read_bytes()
+                self.assertEqual(sha(raw), expected_sha)
+                scripts = re.findall(r'<script\b[^>]*>(.*?)</script\s*>',
+                                     raw.decode('utf-8-sig'), re.DOTALL)
+                method = 'bmAgree' if filename.startswith('agree') else 'bm'
+                matching = [source for source in scripts if re.match(
+                    r'\s*webPages\.saishi\.' + method + r'\.init\(', source)]
+                self.assertEqual(len(matching), 1)
+                self.assertEqual(len(re.findall(r'new Date\(', matching[0])), 3)
+                config = agreements._parse_init_script(matching[0], method)
+                self.assertIsNotNone(config)
+                for key in ('nowTime', 'preTime', 'startTime'):
+                    self.assertRegex(config[key], r'^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$')
+                self.assertEqual({key: config[key] for key in agreements.PROJECT_IDENTITY},
+                                 agreements.PROJECT_IDENTITY)
+                if method == 'bmAgree':
+                    self.assertEqual(entry_contract_pin(config), agreements.ENTRY_CONTRACT_SHA256)
+                for field in config['form']['inputs']:
+                    if field['name'] in agreements.FORM_INPUT_SHA256:
+                        self.assertEqual(agreements._canonical_sha(field), agreements.FORM_INPUT_SHA256[field['name']])
+
 
 if __name__ == '__main__':
     unittest.main()

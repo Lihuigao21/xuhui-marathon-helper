@@ -10,6 +10,7 @@ import hashlib
 import html
 from html.parser import HTMLParser
 import json
+from datetime import datetime
 import re
 import unicodedata
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
@@ -114,22 +115,54 @@ def _reject_json_constant(value):
     raise ValueError('Non-JSON constant')
 
 
+def _json_with_date_data(source: str) -> str:
+    """Convert the site's one observed Date literal syntax to string data.
+
+    This is a lexer, not JavaScript evaluation: complete JSON strings are copied
+    unchanged.  Outside those strings only new Date('YYYY/MM/DD HH:mm:ss') (or
+    the same literal in double quotes) is recognized.  A real calendar check
+    rejects invalid dates.  Every other expression remains non-JSON and is
+    rejected by the normal decoder below.  No Date or site object is called.
+    """
+    literal = re.compile(r'''new Date\((['"])([0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\1\)''')
+    decoder = json.JSONDecoder()
+    parts, position = [], 0
+    while position < len(source):
+        if source[position] == '"':
+            _, end = decoder.raw_decode(source, position)
+            parts.append(source[position:end])
+            position = end
+            continue
+        match = literal.match(source, position)
+        if match:
+            value = match.group(2)
+            datetime.strptime(value, '%Y/%m/%d %H:%M:%S')
+            parts.append(json.dumps(value))
+            position = match.end()
+            continue
+        parts.append(source[position])
+        position += 1
+    return ''.join(parts)
+
+
 def _parse_init_script(source: str, method: str):
-    """Parse the observed standalone init(JSON) syntax; never execute source.
+    """Parse standalone init data, including the site's observed date literals.
 
     The frozen entry page uses bmAgree.init; the frozen registration response
-    uses bm.init.  Wrappers, variable arguments, comments, extra statements and
-    duplicate keys are unsupported, so they cannot supply an acceptance pin.
+    uses bm.init.  JSON is unchanged; exact calendar-validated Date literals are
+    read as strings only.  Wrappers, variable arguments, other expressions,
+    comments, extra statements and duplicate keys cannot supply an acceptance pin.
     """
     prefix = re.match(r'\A\s*webPages\s*\.\s*saishi\s*\.\s*' + re.escape(method)
                       + r'\s*\.\s*init\s*\(\s*', source)
     if prefix is None:
         return None
     try:
+        data = _json_with_date_data(source[prefix.end():])
         decoder = json.JSONDecoder(object_pairs_hook=_unique_json_object,
                                    parse_constant=_reject_json_constant)
-        config, end = decoder.raw_decode(source, prefix.end())
-        if not isinstance(config, dict) or not re.fullmatch(r'\s*\)\s*;?\s*', source[end:]):
+        config, end = decoder.raw_decode(data)
+        if not isinstance(config, dict) or not re.fullmatch(r'\s*\)\s*;?\s*', data[end:]):
             return None
         # Also reject values that cannot have the declared UTF-8 canonical form.
         _canonical_sha(config)
