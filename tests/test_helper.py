@@ -1,6 +1,7 @@
 """Task-local regression checks; all personal values below are fictional fixtures."""
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location('westbund_helper', ROOT / 'helper.py')
 h = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(h)
@@ -79,6 +81,16 @@ class Contracts(unittest.TestCase):
                     '{province:true,city:"上海市",xian:"徐汇区"}', '[]', '{}', 'invalid'):
             with self.subTest(raw=raw):
                 self.assertIsNone(h._city_data(raw))
+
+    def test_plain_clothing_size_uses_explicit_gender_without_changing_prefixed_values(self):
+        folder = ROOT / '.test-temp'
+        folder.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=folder, suffix='.json', delete=False) as stream:
+            json.dump({'报名资料': {'性别': '女', '衣服尺码': ' m '}}, stream, ensure_ascii=False)
+            path = Path(stream.name)
+        self.assertEqual(h.read_profile(path)[0]['衣服尺码'], '女M')
+        path.write_text(json.dumps({'报名资料': {'性别': '男', '衣服尺码': '女M'}}, ensure_ascii=False), encoding='utf-8')
+        self.assertEqual(h.read_profile(path)[0]['衣服尺码'], '女M')
 
 
 class BrowserFixture(unittest.TestCase):

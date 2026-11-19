@@ -1,4 +1,4 @@
-"""Westbund 10K: one browser, optional one timed refresh, ordinary-field autofill."""
+"""Westbund 10K: ordinary-field autofill and explicit single-submit modes."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout
 from playwright.sync_api import sync_playwright
+from pickers import select_birthday, select_country
 
 HERE = Path(__file__).resolve().parent
 TASK = HERE
@@ -24,10 +25,10 @@ FIELDS = {
     '证件类型': ('idcardtype', 'select'),
     '证件号码': ('idcardnumber', 'text'),
     '性别': ('sex', 'choice'),
-    '出生日期': ('birthday', 'text'),
+    '出生日期': ('birthday', 'date'),
     '手机号码': ('mobile', 'text'),
     '电子邮件': ('email', 'text'),
-    '所在国家或地区': ('country', 'select'),
+    '所在国家或地区': ('country', 'country'),
     '所在城市': ('city', 'city'),
     '所在地址': ('address', 'text'),
     '血型': ('blood', 'select'),
@@ -35,7 +36,7 @@ FIELDS = {
     '紧急联系人姓名': ('contactname', 'text'),
     '紧急联系人手机号码': ('contactmobile', 'text'),
 }
-MANUAL = ['参赛声明', '监护人声明（如适用）', '装备信息/成绩/资格确认', '验证码（如出现）', '最终核对、提交与付款']
+MANUAL = ['参赛声明', '监护人声明（如适用）', '装备信息/成绩/资格确认', '验证码（如出现）', '付款']
 
 
 class ProfileError(ValueError):
@@ -79,6 +80,9 @@ def read_profile(path: Path) -> tuple[dict[str, str], datetime | None]:
     if any(not isinstance(v, str) or len(v) > 500 for v in values.values()):
         raise ProfileError('每项资料必须是长度不超过500的字符串。')
     values = {k: v.strip() for k, v in values.items() if v.strip()}
+    size = values.get('衣服尺码', '').upper()
+    if size in ('XS', 'S', 'M', 'L', 'XL', '2XL', '3XL') and values.get('性别') in ('男', '女'):
+        values['衣服尺码'] = values['性别'] + size
     if '所在城市' in values:
         parse_city(values['所在城市'])
     for label in ('手机号码', '紧急联系人手机号码'):
@@ -290,7 +294,11 @@ def fill_fields(page, values: dict[str, str], *, offline_test=False) -> list[dic
         status = 'missing_or_hidden'
         try:
             if row.count() == 1 and row.is_visible():
-                if kind == 'city':
+                if kind == 'date':
+                    status = select_birthday(page, row, value)
+                elif kind == 'country':
+                    status = select_country(page, row, value)
+                elif kind == 'city':
                     status = select_city(page, row, value)
                 elif kind == 'select':
                     if field == 'clothesize':
@@ -357,7 +365,7 @@ def _submit_target(page):
     if candidates.count() != 1:
         return None
     button = candidates.first
-    if not button.is_visible():
+    if not button.is_visible() or not button.is_enabled():
         return None
     classes = (button.get_attribute('class') or '').split()
     if 'disabled' in classes or button.get_attribute('aria-disabled') == 'true':
@@ -372,18 +380,9 @@ def _submit_target(page):
         return None
 
 
-def confirm_and_click_submit(page, answer_reader=input) -> str:
-    """Click only after exact confirmation and a second identity/preview check."""
-    target = _submit_target(page)
-    if target is None:
-        return 'preview_not_ready'
+def _click_same_submit_target(page, target) -> str:
+    """Make at most one click attempt after the caller's authorization checks."""
     handle, signature = target
-    try:
-        answer = answer_reader('已到达预览页。最终提交会创建报名结果；必须输入 SUBMIT 并回车，其他内容取消：')
-    except (EOFError, KeyboardInterrupt):
-        return 'cancelled'
-    if answer != 'SUBMIT':
-        return 'cancelled'
     try:
         renewed = _submit_target(page)
         if renewed is None:
@@ -394,11 +393,203 @@ def confirm_and_click_submit(page, answer_reader=input) -> str:
         same_element = page.evaluate('(els) => els[0] === els[1]', [handle, renewed_handle])
         if not same_element:
             return 'target_changed'
-        handle.click(timeout=5000)
-        page.wait_for_timeout(1000)
-        return 'clicked'
     except BrowserError:
-        return 'click_failed'
+        return 'target_changed'
+    try:
+        handle.click(timeout=5000)
+    except BrowserError:
+        # The click might have reached the site before navigation/connection failed.
+        # Return without retrying; never equate a client error with zero submission.
+        return 'click_outcome_unknown'
+    return 'clicked'
+
+
+def confirm_and_click_submit(page, answer_reader=input) -> str:
+    """Legacy opt-in mode: exact confirmation, followed by one official click."""
+    target = _submit_target(page)
+    if target is None:
+        return 'preview_not_ready'
+    try:
+        answer = answer_reader('已到达预览页。最终提交会创建报名结果；必须输入 SUBMIT 并回车，其他内容取消：')
+    except (EOFError, KeyboardInterrupt):
+        return 'cancelled'
+    if answer != 'SUBMIT':
+        return 'cancelled'
+    return _click_same_submit_target(page, target)
+
+
+def _registration_for_auto_submit(page) -> bool:
+    if not event_page(page.url, 'reg.html'):
+        return False
+    query = parse_qs(urlsplit(page.url).query)
+    return query.get('subgroup') == [GROUP] and query.get('forcegoing') != ['true']
+
+
+def _source_form(page):
+    forms = page.locator('.divBmForm').filter(has=page.locator('input[name="name"]'))
+    return forms.first if forms.count() == 1 else None
+
+
+def _text(value: str) -> str:
+    return ' '.join(value.split())
+
+
+def _profile_snapshot(page, values: dict[str, str]):
+    """Read original controls even when the site's preview hides their container."""
+    source = _source_form(page)
+    if source is None:
+        return None
+    snapshot = {}
+    for label, value in values.items():
+        field, kind = FIELDS[label]
+        row = source.locator('.bx_ui_form_tab_n_' + field)
+        if row.count() != 1:
+            return None
+        if kind == 'city':
+            control = row.locator('input[name="city"]')
+            display = row.locator('input[name="city_text"]')
+            if control.count() != 1 or display.count() != 1:
+                return None
+            saved = _city_data(control.input_value())
+            requested = parse_city(value)
+            if not saved or any(_city_name(saved[column], column) != _city_name(part, column)
+                                for column, part in zip(('province', 'city', 'xian'), requested)):
+                return None
+            if _text(display.input_value()) != _text(' '.join(dict.fromkeys(saved[column] for column in ('province', 'city', 'xian')))):
+                return None
+            preview_value = ' '.join(saved[column] for column in ('province', 'city', 'xian'))
+            actual = control.input_value()
+        elif kind == 'choice':
+            checked = row.locator(f'input[name="{field}"]:checked')
+            if checked.count() != 1 or checked.input_value() != value:
+                return None
+            actual = preview_value = value
+        else:
+            control = row.locator(f'input[name="{field}"], select[name="{field}"]')
+            if control.count() != 1 or control.input_value() != value:
+                return None
+            actual = control.input_value()
+            if control.evaluate('el=>el.tagName') == 'SELECT':
+                selected = control.locator('option:checked')
+                if selected.count() != 1:
+                    return None
+                preview_value = selected.inner_text()
+            else:
+                preview_value = actual
+        snapshot[field] = {'value': actual, 'preview': _text(preview_value)}
+    return snapshot
+
+
+def _required_pending(page) -> list[str]:
+    """Inspect visible required controls; do not check acknowledgements ourselves."""
+    source = _source_form(page)
+    if source is None:
+        return ['报名表']
+    pending = source.evaluate('''form => {
+      const visible=el=>{
+        // Preview hides the whole source form. Ignore that one container while
+        // respecting conditional hiding of individual rows or intermediate tabs.
+        for(let node=el;node&&node!==form;node=node.parentElement){
+          const style=getComputedStyle(node);
+          if(node.hidden||style.display==='none'||style.visibility==='hidden')return false;
+        }
+        return true;
+      };
+      const pending=[];
+      for(const row of form.querySelectorAll('.bx_ui_form_tab.rfv,.bx_ui_form_row.rfv')){
+        if(!visible(row)||row.classList.contains('disabled'))continue;
+        const name=[...row.classList].find(c=>c.startsWith('bx_ui_form_tab_n_'))?.slice(17)||'required';
+        const controls=[...row.querySelectorAll('input[name],select[name],textarea[name]')].filter(el=>!el.disabled);
+        const choices=controls.filter(el=>['checkbox','radio'].includes(el.type));
+        const fields=controls.filter(el=>!['checkbox','radio','button','submit','reset'].includes(el.type));
+        if(!controls.length||(choices.length&&!choices.some(el=>el.checked))||
+           fields.some(el=>!el.value.trim()||(el.validity&&!el.validity.valid)))pending.push(name);
+      }
+      for(const el of form.querySelectorAll('[required]')){
+        if(el.disabled||!visible(el))continue;
+        if((['checkbox','radio'].includes(el.type)&&!el.checked)||!el.value.trim()||
+           (el.validity&&!el.validity.valid))pending.push(el.name||'required');
+      }
+      return [...new Set(pending)];
+    }''')
+    labels = {field: label for label, (field, _) in FIELDS.items()}
+    labels.update(jhragree='监护人声明', follow='装备领取确认', checkagree='成绩审核确认', checkagree2='资格审核确认')
+    return [labels.get(field, '页面必填或验证项') for field in pending]
+
+
+def _preview_snapshot(page, values: dict[str, str]):
+    preview = page.locator('.divBmFormView:visible')
+    if preview.count() != 1:
+        return None
+    snapshot = _profile_snapshot(page, values)
+    if snapshot is None:
+        return None
+    for field, item in snapshot.items():
+        row = preview.locator(f'.bx_ui_form_tab_n_{field}')
+        display = row.locator(f'.bx_ui_remark[name="{field}"]')
+        if (row.count() != 1 or not row.is_visible() or display.count() != 1
+                or not display.is_visible() or _text(display.inner_text()) != item['preview']):
+            return None
+    return snapshot
+
+
+def automatic_submit(page, values: dict[str, str], *, timeout_seconds=1800) -> str:
+    """Explicit --auto-submit authorization: verify data, preview, then click once."""
+    if set(FIELDS) - set(values):
+        return 'profile_incomplete'
+    deadline = time.monotonic() + timeout_seconds
+    last_pending = None
+    while time.monotonic() < deadline:
+        if page.is_closed() or not _registration_for_auto_submit(page):
+            return 'left_event'
+        if page.locator('.divBmFormView:visible').count():
+            break
+        snapshot = _profile_snapshot(page, values)
+        pending = _required_pending(page)
+        if snapshot is None:
+            pending.append('资料尚未与 JSON 一致')
+        if page.locator('.bx_ui_area:visible, .dw-persp:visible, .mbsc-fr-persp:visible, .bx_ui_dlg:visible').count():
+            pending.append('尚未关闭的选择器或提示框')
+        if pending:
+            pending = sorted(set(pending))
+            if pending != last_pending:
+                print('自动提交等待：' + '；'.join(pending), flush=True)
+                last_pending = pending
+            page.wait_for_timeout(500)
+            continue
+        candidates = page.locator('.divBmFormBtns a.aBtnView, .divBmFormBtns button.aBtnView')
+        if candidates.count() != 1 or not candidates.is_visible() or not candidates.is_enabled():
+            return 'preview_unavailable'
+        if ('disabled' in (candidates.get_attribute('class') or '').split()
+                or candidates.get_attribute('aria-disabled') == 'true'):
+            return 'preview_unavailable'
+        # One normal website validation/preview click, with no forcegoing/API bypass.
+        candidates.click(timeout=5000)
+        try:
+            page.locator('.divBmFormView:visible').wait_for(state='visible', timeout=5000)
+        except BrowserTimeout:
+            return 'preview_rejected'
+        break
+    else:
+        return 'waiting_timeout'
+    if not _registration_for_auto_submit(page):
+        return 'left_event'
+    if _required_pending(page):
+        return 'requirements_changed'
+    snapshot = _preview_snapshot(page, values)
+    if snapshot is None:
+        return 'preview_mismatch'
+    target = _submit_target(page)
+    if target is None:
+        return 'preview_unavailable'
+    # Re-read both original data and visible preview after acquiring the button.
+    if _required_pending(page):
+        return 'requirements_changed'
+    if _preview_snapshot(page, values) != snapshot or not _registration_for_auto_submit(page):
+        return 'preview_changed'
+    if _required_pending(page):
+        return 'requirements_changed'
+    return _click_same_submit_target(page, target)
 
 
 def assisted_submit(page, timeout_seconds=1800, answer_reader=input) -> str:
@@ -420,8 +611,13 @@ def assisted_submit(page, timeout_seconds=1800, answer_reader=input) -> str:
     return 'preview_timeout'
 
 
-def run(profile_path: Path, check_only=False, smoke=False, assisted=False) -> int:
+def run(profile_path: Path, check_only=False, smoke=False, assisted=False, auto=False) -> int:
     values, target = read_profile(profile_path)
+    if auto and (smoke or assisted):
+        raise ProfileError('自动提交不能与只读检查或人工确认提交模式同时启用。')
+    if auto and set(FIELDS) - set(values):
+        missing = [label for label in FIELDS if label not in values]
+        raise ProfileError('自动提交须先补齐 JSON 普通资料：' + '、'.join(missing))
     print(f'资料格式有效：{len(values)}项非空字段。程序不输出资料值。', flush=True)
     if check_only:
         return 0
@@ -463,11 +659,28 @@ def run(profile_path: Path, check_only=False, smoke=False, assisted=False) -> in
                 for result in results:
                     if result['status'] not in ('filled', 'already_set'):
                         print('需手动：' + result['label'], flush=True)
-                print('请在页面核对资料。还需手动：' + '；'.join(MANUAL), flush=True)
-                if assisted:
+                print('如出现以下项目，请在页面自行处理：' + '；'.join(MANUAL), flush=True)
+                if auto:
+                    print('已启用自动提交：资料和页面必填项齐全后，助手自动进入预览并提交一次，无需输入 SUBMIT。', flush=True)
+                    state = automatic_submit(page, values)
+                    messages = {'clicked': '已点击一次官方最终提交按钮，请查看官网结果；付款仍由你处理。',
+                                'click_outcome_unknown': '提交点击结果尚不确定，已停止重试；请核对官网结果，避免重复报名。',
+                                'profile_incomplete': 'JSON 普通资料不完整，未提交。',
+                                'preview_rejected': '官网未接受资料或预览条件未满足，未点击最终提交。',
+                                'preview_mismatch': '预览与 JSON 核对不一致，未提交。',
+                                'preview_changed': '核对后预览发生变化，未提交。',
+                                'requirements_changed': '预览后必填项或确认状态发生变化，未提交。',
+                                'target_changed': '最终提交目标发生变化，未提交。',
+                                'preview_unavailable': '预览或提交控件不可用，未提交。',
+                                'left_event': '已离开指定报名页面，停止自动提交。',
+                                'waiting_timeout': '等待必填项或验证完成超时，未提交。'}
+                    print(messages.get(state, '自动提交已停止，请检查官网页面。'), flush=True)
+                elif assisted:
                     state = assisted_submit(page)
                     if state == 'clicked':
                         print('已停止自动操作；如进入支付/订单页，请由你手动处理。', flush=True)
+                else:
+                    print('普通预填模式不提交，请自行核对和提交。', flush=True)
             else:
                 print('未在30分钟内到达可识别表单，或离开指定页面。请手动继续。', flush=True)
             return keep_open(context, page)
@@ -496,11 +709,14 @@ def main() -> int:
     parser.add_argument('--profile', type=Path, default=HERE / 'profile.json')
     parser.add_argument('--check-profile', action='store_true')
     parser.add_argument('--smoke', action='store_true', help='empty-template read-only live entry check, then close')
-    parser.add_argument('--assisted-submit', action='store_true',
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--assisted-submit', action='store_true',
                         help='after you manually reach preview, require exact SUBMIT confirmation before one official click')
+    modes.add_argument('--auto-submit', action='store_true',
+                       help='verify complete JSON and preview, then automatically click the official submit button once')
     args = parser.parse_args()
     try:
-        return run(args.profile, args.check_profile, args.smoke, args.assisted_submit)
+        return run(args.profile, args.check_profile, args.smoke, args.assisted_submit, args.auto_submit)
     except ProfileError as e:
         print(str(e), file=sys.stderr)
         return 2
