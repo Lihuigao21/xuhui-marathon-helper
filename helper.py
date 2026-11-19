@@ -13,13 +13,14 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout
 from playwright.sync_api import sync_playwright
 from pickers import select_birthday, select_country
+from agreements import accept_entry_agreement, accept_form_agreements, verify_form_agreements
 
 HERE = Path(__file__).resolve().parent
 TASK = HERE
 ENTRY = 'https://www.xuhui-marathon.com/b/FrAJj2/entry.html'
 PREFIX = '/b/FrAJj2/'
 GROUP = '10公里跑'
-# An explicit allowlist. Agreements, OTPs, uploads and payment have no fill action.
+# Ordinary-field allowlist. Known agreements have a separate explicit auto-mode adapter.
 FIELDS = {
     '真实姓名': ('name', 'text'),
     '证件类型': ('idcardtype', 'select'),
@@ -37,6 +38,7 @@ FIELDS = {
     '紧急联系人手机号码': ('contactmobile', 'text'),
 }
 MANUAL = ['参赛声明', '监护人声明（如适用）', '装备信息/成绩/资格确认', '验证码（如出现）', '付款']
+AUTO_MANUAL = ['新出现或内容改变的声明', '验证码/登录/排队（如出现）', '付款']
 
 
 class ProfileError(ValueError):
@@ -76,7 +78,7 @@ def read_profile(path: Path) -> tuple[dict[str, str], datetime | None]:
         raise ProfileError('开放时间必须是字符串。')
     values = data.get('报名资料')
     if not isinstance(values, dict) or set(values) - set(FIELDS):
-        raise ProfileError('报名资料包含未知字段，请按模板填写；声明和验证码必须在页面手动操作。')
+        raise ProfileError('报名资料包含未知字段，请按模板填写；声明不作为JSON资料字段。')
     if any(not isinstance(v, str) or len(v) > 500 for v in values.values()):
         raise ProfileError('每项资料必须是长度不超过500的字符串。')
     values = {k: v.strip() for k, v in values.items() if v.strip()}
@@ -148,7 +150,7 @@ def enter_available_group(page) -> str:
         href = link.get_attribute('href') or ''
         if not registration_link(href) or not link.is_visible():
             return 'manual'
-        # The only navigation click made by the helper. No consent/next/submit button.
+        # Use the normal event entry. Automatic mode handles known consent separately.
         link.click(timeout=10000)
         return 'entered'
     return 'not_ready'
@@ -342,14 +344,42 @@ def fill_fields(page, values: dict[str, str], *, offline_test=False) -> list[dic
     return results
 
 
-def await_form(page, timeout_seconds=1800) -> bool:
+def await_form(page, timeout_seconds=1800, *, accept_agreements=False) -> bool:
     deadline = time.monotonic() + timeout_seconds
+    last_agreement_state = None
+    entry_render_ready = False
     while time.monotonic() < deadline:
         if not event_page(page.url):
             return False
         if event_page(page.url, 'reg.html') and page.locator('.bx_ui_form_tab_n_name').is_visible():
             return True
-        # Observe local DOM/URL only; no refresh, endpoint calls or consent actions.
+        if accept_agreements and event_page(page.url, 'agree.html'):
+            if not entry_render_ready:
+                # Navigation may finish before the site's JS inserts the terms.
+                # Wait for that rendering step before interpreting missing
+                # contract structure as a change. No consent during this wait.
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                try:
+                    page.locator('.divBm_agree .divUserAgree > .divCnt').wait_for(
+                        state='visible', timeout=min(15000, remaining_ms))
+                except BrowserTimeout:
+                    print('入口协议尚未加载完成，已停止自动操作，请检查网页。', flush=True)
+                    return False
+                if not event_page(page.url, 'agree.html'):
+                    continue
+                entry_render_ready = True
+            state = accept_entry_agreement(page)
+            if state != last_agreement_state:
+                messages = {'waiting': '入口协议：等待官网倒计时或控件就绪。',
+                            'accepted': '已同意已知参赛声明并点击下一步。',
+                            'terms_changed': '入口协议内容或目标变化，已停止自动同意，请在网页检查。',
+                            'navigation_unknown': '入口协议点击结果不确定，已停止自动操作，请检查网页。'}
+                if state in messages:
+                    print(messages[state], flush=True)
+                last_agreement_state = state
+            if state in ('terms_changed', 'navigation_unknown'):
+                return False
+        # Local DOM/URL waiting only; no refresh or endpoint polling.
         page.wait_for_timeout(500)
     return False
 
@@ -533,19 +563,40 @@ def _preview_snapshot(page, values: dict[str, str]):
     return snapshot
 
 
-def automatic_submit(page, values: dict[str, str], *, timeout_seconds=1800) -> str:
+def automatic_submit(page, values: dict[str, str], *, timeout_seconds=1800, accept_agreements=False) -> str:
     """Explicit --auto-submit authorization: verify data, preview, then click once."""
     if set(FIELDS) - set(values):
         return 'profile_incomplete'
     deadline = time.monotonic() + timeout_seconds
     last_pending = None
+    agreement_snapshot = None
     while time.monotonic() < deadline:
         if page.is_closed() or not _registration_for_auto_submit(page):
             return 'left_event'
         if page.locator('.divBmFormView:visible').count():
+            if accept_agreements:
+                result = verify_form_agreements(page, agreement_snapshot)
+                if result['status'] not in ('accepted', 'already_accepted'):
+                    return 'agreements_changed'
+                agreement_snapshot = result['snapshot']
             break
         snapshot = _profile_snapshot(page, values)
         pending = _required_pending(page)
+        if accept_agreements and snapshot is not None:
+            if agreement_snapshot is None:
+                result = accept_form_agreements(page)
+                if result['status'] in ('accepted', 'already_accepted'):
+                    agreement_snapshot = result['snapshot']
+                    pending = _required_pending(page)
+                    print('已核对并同意表单中的四项已知确认。', flush=True)
+                elif result['status'] in ('terms_changed', 'not_applicable'):
+                    return 'agreements_changed'
+                elif result['status'] == 'click_outcome_unknown':
+                    return 'agreement_outcome_unknown'
+                else:
+                    pending.append('已知协议控件尚未就绪')
+            elif verify_form_agreements(page, agreement_snapshot)['status'] not in ('accepted', 'already_accepted'):
+                return 'agreements_changed'
         if snapshot is None:
             pending.append('资料尚未与 JSON 一致')
         if page.locator('.bx_ui_area:visible, .dw-persp:visible, .mbsc-fr-persp:visible, .bx_ui_dlg:visible').count():
@@ -576,6 +627,8 @@ def automatic_submit(page, values: dict[str, str], *, timeout_seconds=1800) -> s
         return 'left_event'
     if _required_pending(page):
         return 'requirements_changed'
+    if accept_agreements and verify_form_agreements(page, agreement_snapshot)['status'] not in ('accepted', 'already_accepted'):
+        return 'agreements_changed'
     snapshot = _preview_snapshot(page, values)
     if snapshot is None:
         return 'preview_mismatch'
@@ -585,10 +638,14 @@ def automatic_submit(page, values: dict[str, str], *, timeout_seconds=1800) -> s
     # Re-read both original data and visible preview after acquiring the button.
     if _required_pending(page):
         return 'requirements_changed'
+    if accept_agreements and verify_form_agreements(page, agreement_snapshot)['status'] not in ('accepted', 'already_accepted'):
+        return 'agreements_changed'
     if _preview_snapshot(page, values) != snapshot or not _registration_for_auto_submit(page):
         return 'preview_changed'
     if _required_pending(page):
         return 'requirements_changed'
+    if accept_agreements and verify_form_agreements(page, agreement_snapshot)['status'] not in ('accepted', 'already_accepted'):
+        return 'agreements_changed'
     return _click_same_submit_target(page, target)
 
 
@@ -651,18 +708,21 @@ def run(profile_path: Path, check_only=False, smoke=False, assisted=False, auto=
                             'manual': '页面结构或入口已变化，请在官方页面手动继续。'}
                 print(messages[state], flush=True)
                 return keep_open(context, page)
-            print('如出现声明/验证码/登录/排队，请在页面自行完成；助手只等待表单。', flush=True)
-            if await_form(page):
+            if auto:
+                print('自动报名将同意本赛事已知入口协议及表单四项确认；验证码/登录/排队仍需你处理。', flush=True)
+            else:
+                print('如出现声明/验证码/登录/排队，请在页面自行完成；助手只等待表单。', flush=True)
+            if await_form(page, accept_agreements=auto):
                 results = fill_fields(page, values)
                 filled = sum(r['status'] in ('filled', 'already_set') for r in results)
                 print(f'已填/已有相同值：{filled}/{len(values)} 项。', flush=True)
                 for result in results:
                     if result['status'] not in ('filled', 'already_set'):
                         print('需手动：' + result['label'], flush=True)
-                print('如出现以下项目，请在页面自行处理：' + '；'.join(MANUAL), flush=True)
+                print('如出现以下项目，请在页面自行处理：' + '；'.join(AUTO_MANUAL if auto else MANUAL), flush=True)
                 if auto:
                     print('已启用自动提交：资料和页面必填项齐全后，助手自动进入预览并提交一次，无需输入 SUBMIT。', flush=True)
-                    state = automatic_submit(page, values)
+                    state = automatic_submit(page, values, accept_agreements=True)
                     messages = {'clicked': '已点击一次官方最终提交按钮，请查看官网结果；付款仍由你处理。',
                                 'click_outcome_unknown': '提交点击结果尚不确定，已停止重试；请核对官网结果，避免重复报名。',
                                 'profile_incomplete': 'JSON 普通资料不完整，未提交。',
@@ -670,6 +730,8 @@ def run(profile_path: Path, check_only=False, smoke=False, assisted=False, auto=
                                 'preview_mismatch': '预览与 JSON 核对不一致，未提交。',
                                 'preview_changed': '核对后预览发生变化，未提交。',
                                 'requirements_changed': '预览后必填项或确认状态发生变化，未提交。',
+                                'agreements_changed': '表单协议内容、控件或勾选状态变化，未提交，请检查官网。',
+                                'agreement_outcome_unknown': '协议点击结果不确定，已停止自动操作，请检查官网。',
                                 'target_changed': '最终提交目标发生变化，未提交。',
                                 'preview_unavailable': '预览或提交控件不可用，未提交。',
                                 'left_event': '已离开指定报名页面，停止自动提交。',
@@ -682,7 +744,7 @@ def run(profile_path: Path, check_only=False, smoke=False, assisted=False, auto=
                 else:
                     print('普通预填模式不提交，请自行核对和提交。', flush=True)
             else:
-                print('未在30分钟内到达可识别表单，或离开指定页面。请手动继续。', flush=True)
+                print('尚未到达可识别表单，或协议/页面检查未通过。自动操作已停止，请查看网页。', flush=True)
             return keep_open(context, page)
         except BrowserError:
             if not page.is_closed():
@@ -713,7 +775,7 @@ def main() -> int:
     modes.add_argument('--assisted-submit', action='store_true',
                         help='after you manually reach preview, require exact SUBMIT confirmation before one official click')
     modes.add_argument('--auto-submit', action='store_true',
-                       help='verify complete JSON and preview, then automatically click the official submit button once')
+                       help='accept this event\'s known agreements, verify JSON and preview, then click official submit once')
     args = parser.parse_args()
     try:
         return run(args.profile, args.check_profile, args.smoke, args.assisted_submit, args.auto_submit)
